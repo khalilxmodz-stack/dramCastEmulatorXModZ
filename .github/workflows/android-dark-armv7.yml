@@ -1,0 +1,109 @@
+name: Android (Flycast Dark, armeabi-v7a)
+
+on:
+  workflow_dispatch:
+  push:
+    branches-ignore:
+      - 'l10n_**'
+  pull_request:
+
+# Least privilege: this job only reads the repository. No secrets are used or required.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build armeabi-v7a APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      # Must match ndkVersion / cmake version in shell/android-studio/flycast/build.gradle.kts
+      NDK_VERSION: 29.0.14206865
+      CMAKE_VERSION: 3.22.1
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install ccache libcurl4-openssl-dev
+
+      # Submodules are required: SDL, oboe, glslang, Vulkan-Headers, rcheevos, libchdr, ... live there.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - uses: actions/cache@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-android-armv7-${{ github.sha }}
+          restore-keys: ccache-android-armv7-
+
+      - name: Install Android NDK and CMake
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}"
+
+      # No signing secrets: when ANDROID_KEYSTORE_PASSWORD is unset, build.gradle.kts signs the
+      # release variant with the repository's debug keystore.
+      - name: Build release APK (armeabi-v7a)
+        working-directory: shell/android-studio
+        run: |
+          set -o pipefail
+          ./gradlew assembleRelease --stacktrace --no-daemon 2>&1 | tee "$GITHUB_WORKSPACE/gradle-build.log"
+
+      - name: Locate and verify APK
+        id: apk
+        run: |
+          set -eu
+          APK_DIR=shell/android-studio/flycast/build/outputs/apk/release
+          APK=$(find "$APK_DIR" -maxdepth 1 -name '*.apk' | head -n 1)
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
+            echo "::error::No APK found in $APK_DIR"; ls -la "$APK_DIR" || true; exit 1
+          fi
+          echo "APK: $APK ($(stat -c %s "$APK") bytes)"
+          LIBS=$(unzip -Z1 "$APK" | grep '^lib/' || true)
+          echo "Native libraries in APK:"; echo "$LIBS"
+          echo "$LIBS" | grep -qx 'lib/armeabi-v7a/libflycast.so' \
+            || { echo "::error::lib/armeabi-v7a/libflycast.so missing from APK"; exit 1; }
+          if echo "$LIBS" | grep -Eq '^lib/(arm64-v8a|x86|x86_64)/'; then
+            echo "::error::APK contains non-armeabi-v7a native libraries"; exit 1
+          fi
+          # ELF class check: a 32-bit ARM library has EI_CLASS=1 (32-bit) and e_machine=0x28 (ARM)
+          unzip -p "$APK" lib/armeabi-v7a/libflycast.so | head -c 20 | od -An -tx1 | tr -d '\n' > elfhdr.txt
+          cat elfhdr.txt; echo
+          grep -q '^ *7f 45 4c 46 01' elfhdr.txt || { echo "::error::libflycast.so is not a 32-bit ELF"; exit 1; }
+          grep -q '28 00 *$' elfhdr.txt || { echo "::error::libflycast.so is not an ARM ELF"; exit 1; }
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: flycast-dark-armeabi-v7a.apk
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+
+      - name: Collect failure logs
+        if: failure()
+        run: |
+          mkdir -p failure-logs
+          cp gradle-build.log failure-logs/ 2>/dev/null || true
+          cp -r shell/android-studio/flycast/build/reports failure-logs/gradle-reports 2>/dev/null || true
+          find shell/android-studio/flycast/.cxx -name '*.txt' -path '*armeabi-v7a*' \
+            \( -name 'build_output.txt' -o -name 'cmake_server_log.txt' -o -name 'configure_stderr.txt' -o -name 'configure_stdout.txt' \) \
+            -exec cp --parents {} failure-logs/ \; 2>/dev/null || true
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-logs
+          path: failure-logs/
+          if-no-files-found: warn

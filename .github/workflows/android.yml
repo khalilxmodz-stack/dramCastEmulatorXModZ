@@ -1,0 +1,100 @@
+name: Android
+
+# Upstream release pipeline (S3/Sentry upload, 4 ABIs). The fork builds with android-dark-armv7.yml;
+# this one is manual-only because its symbol step expects every ABI and the Gradle build is now armeabi-v7a only.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Android
+    runs-on: ubuntu-latest
+
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+    steps:
+      - name: Set up build environment
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install ccache libcurl4-openssl-dev
+
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - uses: actions/cache@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-android-${{ github.sha }}
+          restore-keys: ccache-android-
+
+      - name: Disable release signing
+        run: sed -i 's/signingConfigs.getByName("release")/signingConfigs.getByName("debug")/' shell/android-studio/flycast/build.gradle.kts
+        if: github.repository != 'flyinghead/flycast' || github.event_name != 'push'
+
+      - name: Bump version code
+        run: sed -i 's/versionCode = 8/versionCode = ${{ github.run_number }}/' shell/android-studio/flycast/build.gradle.kts
+
+      - name: Gradle
+        working-directory: shell/android-studio
+        run: ./gradlew assembleRelease bundleRelease --parallel
+        env:
+          SENTRY_UPLOAD_URL: ${{ secrets.SENTRY_UPLOAD_URL }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: flycast-release.apk
+          path: shell/android-studio/flycast/build/outputs/apk/release/flycast-release.apk
+
+      - name: Build dump_syms
+        working-directory: core/deps/breakpad
+        run: |
+          ./configure --prefix=$PWD
+          make -j2
+          make install
+
+      - name: Extract symbols
+        run: |
+          DUMP_SYMS=./core/deps/breakpad/bin/dump_syms
+          SO_DIR=shell/android-studio/flycast/build/intermediates/merged_native_libs/release/mergeReleaseNativeLibs/out/lib
+          for arch in armeabi-v7a ; do
+            $DUMP_SYMS $SO_DIR/$arch/libflycast.so > libflycast.so.sym
+            BUILD_ID=`head -1 libflycast.so.sym | awk '{ print $4 }'`
+            mkdir -p symbols/libflycast.so/$BUILD_ID
+            mv libflycast.so.sym symbols/libflycast.so/$BUILD_ID
+          done
+
+      - name: Setup Rclone
+        uses: AnimMouse/setup-rclone@v1
+        with:
+          rclone_config: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: Upload to S3
+        run: |
+          cp shell/android-studio/flycast/build/outputs/bundle/release/*.aab shell/android-studio/flycast/build/outputs/apk/release/
+          rclone copy shell/android-studio/flycast/build/outputs/apk/release scaleway:flycast-builds/android/${GITHUB_REF#refs/}-$GITHUB_SHA --exclude '*.json'
+        if: github.repository == 'flyinghead/flycast' && github.event_name == 'push'
+
+      - uses: getsentry/action-setup-cli@v1
+
+      - name: Upload symbols to Sentry
+        run: |
+          VERSION=$(git describe --tags --always)
+          sentry-cli releases new "$VERSION"
+          sentry-cli releases set-commits "$VERSION" --auto
+          sentry-cli debug-files upload symbols
+        shell: bash
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_TOKEN }}
+          SENTRY_ORG: flycast
+          SENTRY_PROJECT: minidump
+        if: ${{ env.SENTRY_AUTH_TOKEN != '' && github.event_name == 'push' }}
