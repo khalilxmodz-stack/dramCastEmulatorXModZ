@@ -1,226 +1,135 @@
-/*
-	Copyright 2025 flyinghead
-
-	This file is part of Flycast.
-
-    Flycast is free software: you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 2 of the License, or
-    (at your option) any later version.
-
-    Flycast is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with Flycast.  If not, see <https://www.gnu.org/licenses/>.
-*/
-#include "cfg/cfg.h"
+#include "cfg.h"
+#include "ini.h"
 #include "stdclass.h"
-#include <cstdio>
-#include <cstring>
+#include <cerrno>
 
 namespace config
 {
 
-static void usage(const char *exe)
-{
-	fprintf(stderr, "Usage: %s [option]... [<rom path>]\n", exe);
-	fprintf(stderr, "Options:\n");
-	fprintf(stderr, "-config section:key=value,...  set a transient config value.\n");
-	fprintf(stderr, "                               Transient config values won't be saved to emu.cfg.\n");
-	fprintf(stderr, "-help                          display this help\n");
-}
+static std::string cfgPath;
+static bool autoSaving = true;
+static IniFile cfgdb;
 
-static void parseConfigOption(const std::string& str)
+static void saveFile()
 {
-	char inQuote = '\0';
-	std::string section, key, value;
-	int step = 0; // section, key, value
-	for (char c : str)
-	{
-		if (inQuote != '\0' && c == inQuote)
-		{
-			inQuote = false;
-			step = 0;
-			setTransient(section, key, value);
-			DEBUG_LOG(COMMON, "-config [%s] %s = %s", section.c_str(), key.c_str(), value.c_str());
-			section.clear();
-			key.clear();
-			value.clear();
-			continue;
-		}
-		switch (c)
-		{
-		case ':':
-			switch (step)
-			{
-			case 0:
-				section = trim_trailing_ws(section);
-				if (section.empty()) {
-					WARN_LOG(COMMON, "Invalid -config option '%s'. Format is: -config section:key=value,...", str.c_str());
-					return;
-				}
-				step = 1;
-				break;
-			case 1:
-				key += c;
-				break;
-			case 2:
-				value += c;
-				break;
-			}
-			break;
-		case '=':
-			switch (step)
-			{
-			case 0:
-				WARN_LOG(COMMON, "Invalid -config option '%s'. Format is: -config section:key=value,...", str.c_str());
-				return;
-			case 1:
-				key = trim_trailing_ws(key);
-				if (key.empty()) {
-					WARN_LOG(COMMON, "Invalid -config option '%s'. Format is: -config section:key=value,...", str.c_str());
-					return;
-				}
-				step = 2;
-				break;
-			case 2:
-				value += c;
-				break;
-			}
-			break;
-		case '\'':
-		case '"':
-			switch (step)
-			{
-			case 0:
-				section += c;
-				break;
-			case 1:
-				key += c;
-				break;
-			case 2:
-				if (inQuote == '\0') {
-					inQuote = c;
-					value.clear();
-				}
-				else
-					value += c;
-				break;
-			}
-			break;
-		case ',':
-			switch (step)
-			{
-			case 0:
-				// ignore consecutive commas
-				break;
-			case 1:
-				key += c;
-				break;
-			case 2:
-				if (inQuote != '\0') {
-					value += c;
-				}
-				else
-				{
-					step = 0;
-					setTransient(section, key, value);
-					DEBUG_LOG(COMMON, "-config [%s] %s = %s", section.c_str(), key.c_str(), value.c_str());
-					section.clear();
-					key.clear();
-					value.clear();
-				}
-				break;
-			}
-			break;
-		case ' ':
-			switch (step)
-			{
-			case 0:
-				// Ignore leading spaces. Inner spaces are kept (game ids such as "INITIAL D Ver.2")
-				// and trailing ones are trimmed at the ':' and '=' separators
-				if (!section.empty())
-					section += c;
-				break;
-			case 1:
-				if (!key.empty())
-					key += c;
-				break;
-			case 2:
-				value += c;
-				break;
-			}
-			break;
-		default:
-			switch (step)
-			{
-			case 0:
-				section += c;
-				break;
-			case 1:
-				key += c;
-				break;
-			case 2:
-				value += c;
-				break;
-			}
-		}
+	hostfs::File* cfgfile = hostfs::storage().openFile(cfgPath.c_str(), "wt");
+	if (!cfgfile) {
+		WARN_LOG(COMMON, "Error: Unable to open file '%s' for saving", cfgPath.c_str());
 	}
-	if (step == 2) {
-		setTransient(section, key, value);
-		DEBUG_LOG(COMMON, "-config [%s] %s = %s", section.c_str(), key.c_str(), value.c_str());
+	else {
+		cfgdb.save(cfgfile);
+		delete cfgfile;
 	}
 }
 
-void parseCommandLine(int argc, const char * const argv[])
+static void autoSave() {
+	if (autoSaving)
+		saveFile();
+}
+
+bool open()
 {
-	settings.content.path.clear();
-	const char *exe = argv[0];
-	for (int i = 1; i < argc; i++)
-	{
-		if (!strcmp(argv[i], "-help") || !strcmp(argv[i], "--help")) {
-			usage(exe);
-			exit(0);
-		}
-		if (!strcmp(argv[i], "-config") || !strcmp(argv[i], "--config"))
-		{
-			if (i < argc - 1)
-				parseConfigOption(argv[++i]);
-			continue;
-		}
-		// macOS
-		if (!strncmp(argv[i], "-NSDocumentRevisions", 20)) {
-			i++;
-			continue;
-		}
-		if (argv[i][0] == '-') {
-			WARN_LOG(COMMON, "Ignoring unknown command line option '%s'", argv[i]);
-			continue;
-		}
-		std::string extension = get_file_extension(argv[i]);
-		if (extension == "cdi" || extension == "chd"
-				|| extension == "gdi"|| extension == "cue")
-		{
-			INFO_LOG(COMMON, "Using '%s' as CD image", argv[i]);
-			settings.content.path = argv[i];
-		}
-		else if (extension == "elf")
-		{
-			INFO_LOG(COMMON, "Using '%s' as reios elf file", argv[i]);
-			setTransient("config", "bios.UseReios", "yes");
-			settings.content.path = argv[i];
-		}
-		else {
-			INFO_LOG(COMMON, "Using '%s' as rom", argv[i]);
-			settings.content.path = argv[i];
-		}
-		if (i < argc - 1)
-			WARN_LOG(COMMON, "Rest of command line ignored: '%s'...", argv[i + 1]);
-		break;
+	if (get_writable_config_path("").empty())
+		// Config dir not set (android onboarding)
+		return false;
+
+	const char* filename = "emu.cfg";
+	std::string config_path_read = get_readonly_config_path(filename);
+	cfgPath = get_writable_config_path(filename);
+
+	hostfs::File* cfgfile = hostfs::storage().openFile(config_path_read.c_str(), "rt");
+	if (cfgfile != nullptr) {
+		cfgdb.load(cfgfile);
+		delete cfgfile;
 	}
+	else
+	{
+		// Config file can't be opened
+		int error_code = errno;
+		WARN_LOG(COMMON, "Warning: Unable to open the config file '%s' for reading (%s)", config_path_read.c_str(), strerror(error_code));
+		if (error_code == ENOENT || cfgPath != config_path_read)
+		{
+			// Config file didn't exist
+			INFO_LOG(COMMON, "Creating new empty config file at '%s'", cfgPath.c_str());
+			saveFile();
+		}
+	}
+
+	return true;
+}
+
+void saveStr(const std::string& section, const std::string& key, const std::string& value) {
+	cfgdb.set(section, key, value);
+	autoSave();
+}
+
+std::string loadStr(const std::string& section, const std::string& key, const std::string& def) {
+	return cfgdb.getString(section, key, def);
+}
+
+void saveInt(const std::string& section, const std::string& key, int value) {
+	cfgdb.set(section, key, value);
+	autoSave();
+}
+
+int loadInt(const std::string& section, const std::string& key, int def) {
+	return cfgdb.getInt(section, key, def);
+}
+
+int64_t loadInt64(const std::string& section, const std::string& key, int64_t def) {
+	return cfgdb.getInt64(section, key, def);
+}
+void saveInt64(const std::string& section, const std::string& key, int64_t value) {
+	cfgdb.set(section, key, value);
+	autoSave();
+}
+
+void saveBool(const std::string& section, const std::string& key, bool value) {
+	cfgdb.set(section, key, value);
+	autoSave();
+}
+
+bool loadBool(const std::string& section, const std::string& key, bool def) {
+	return cfgdb.getBool(section, key, def);
+}
+
+void setTransient(const std::string& section, const std::string& key, const std::string& value) {
+	cfgdb.set(section, key, value, true);
+}
+
+bool isTransient(const std::string& section, const std::string& key) {
+	return cfgdb.isTransient(section, key);
+}
+
+bool hasSection(const std::string& section) {
+	return cfgdb.hasSection(section);
+}
+
+void deleteSection(const std::string& section) {
+	cfgdb.deleteSection(section);
+}
+
+void deleteEntry(const std::string& section, const std::string& key) {
+	cfgdb.deleteEntry(section, key);
+}
+
+void setAutoSave(bool autoSaving)
+{
+	config::autoSaving = autoSaving;
+	if (autoSaving)
+		saveFile();
+}
+
+void saveFloat(const std::string& section, const std::string& key, float value) {
+	cfgdb.set(section, key, value);
+	autoSave();
+}
+float loadFloat(const std::string& section, const std::string& key, float def) {
+	return cfgdb.getFloat(section, key, def);
+}
+
+std::vector<std::string> getEntries(const std::string& section) {
+	return cfgdb.getEntryNames(section);
 }
 
 }	// namespace config
