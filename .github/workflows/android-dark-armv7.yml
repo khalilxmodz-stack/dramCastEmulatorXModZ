@@ -29,17 +29,51 @@ jobs:
           sudo apt-get update
           sudo apt-get -y install ccache libcurl4-openssl-dev
 
-      # Submodules are required: SDL, oboe, glslang, Vulkan-Headers, rcheevos, libchdr, ... live there.
-      - uses: actions/checkout@v7
+            - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          submodules: recursive
+          submodules: false   # dependency submodules are fetched below at their pinned commits
+
+      # The repository only needs to hold this workflow, .github/scripts and dark-overlay/.
+      # Everything else is downloaded from upstream Flycast at the base commit, then the modified
+      # "Flycast Dark" files from dark-overlay/ are copied over it.
+      - name: Complete source tree from upstream and apply Flycast Dark overlay
+        run: bash .github/scripts/bootstrap-upstream.sh "$GITHUB_WORKSPACE"
+
+      # The repository may contain the Flycast tree at its root or inside a sub-folder (e.g. when a
+      # source archive was uploaded as-is). Find shell/android-studio/gradlew wherever it is.
+      - name: Locate Flycast project
+        run: |
+          set -eu
+          GRADLEW=$(find . -type f -path '*/shell/android-studio/gradlew' | head -n 1)
+          if [ -z "$GRADLEW" ]; then
+            echo "::error::shell/android-studio/gradlew not found in the repository."
+            echo "Repository top level:"; ls -la
+            echo "Directories (depth <= 3):"; find . -maxdepth 3 -type d -not -path './.git*' | head -n 60
+            echo "Make sure the full Flycast tree (shell/, core/, CMakeLists.txt) was committed and pushed."
+            exit 1
+          fi
+          ANDROID_DIR=$(cd "$(dirname "$GRADLEW")" && pwd)
+          PROJECT_ROOT=$(cd "$ANDROID_DIR/../.." && pwd)
+          echo "ANDROID_DIR=$ANDROID_DIR" >> "$GITHUB_ENV"
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+          echo "Project root: $PROJECT_ROOT"
+          test -f "$PROJECT_ROOT/CMakeLists.txt" || { echo "::error::CMakeLists.txt missing in $PROJECT_ROOT"; exit 1; }
+
+      - name: Populate dependency submodules if empty
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/fetch-submodules.sh" "$PROJECT_ROOT"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - uses: actions/setup-java@v5
         with:
           java-version: '17'
           distribution: 'temurin'
           cache: 'gradle'
+          cache-dependency-path: |
+            ${{ env.ANDROID_DIR }}/**/*.gradle*
+            ${{ env.ANDROID_DIR }}/gradle/wrapper/gradle-wrapper.properties
+            ${{ env.ANDROID_DIR }}/gradle/libs.versions.toml
 
       - uses: actions/cache@v6
         with:
@@ -55,16 +89,17 @@ jobs:
       # No signing secrets: when ANDROID_KEYSTORE_PASSWORD is unset, build.gradle.kts signs the
       # release variant with the repository's debug keystore.
       - name: Build release APK (armeabi-v7a)
-        working-directory: shell/android-studio
+        working-directory: ${{ env.ANDROID_DIR }}
         run: |
           set -o pipefail
+          chmod +x gradlew   # exec bit is lost when the tree comes from a ZIP
           ./gradlew assembleRelease --stacktrace --no-daemon 2>&1 | tee "$GITHUB_WORKSPACE/gradle-build.log"
 
       - name: Locate and verify APK
         id: apk
         run: |
           set -eu
-          APK_DIR=shell/android-studio/flycast/build/outputs/apk/release
+          APK_DIR="$ANDROID_DIR/flycast/build/outputs/apk/release"
           APK=$(find "$APK_DIR" -maxdepth 1 -name '*.apk' | head -n 1)
           if [ -z "$APK" ] || [ ! -f "$APK" ]; then
             echo "::error::No APK found in $APK_DIR"; ls -la "$APK_DIR" || true; exit 1
@@ -95,8 +130,8 @@ jobs:
         run: |
           mkdir -p failure-logs
           cp gradle-build.log failure-logs/ 2>/dev/null || true
-          cp -r shell/android-studio/flycast/build/reports failure-logs/gradle-reports 2>/dev/null || true
-          find shell/android-studio/flycast/.cxx -name '*.txt' -path '*armeabi-v7a*' \
+          cp -r "$ANDROID_DIR/flycast/build/reports" failure-logs/gradle-reports 2>/dev/null || true
+          find "$ANDROID_DIR/flycast/.cxx" -name '*.txt' -path '*armeabi-v7a*' \
             \( -name 'build_output.txt' -o -name 'cmake_server_log.txt' -o -name 'configure_stderr.txt' -o -name 'configure_stdout.txt' \) \
             -exec cp --parents {} failure-logs/ \; 2>/dev/null || true
 
